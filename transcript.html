@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat Transcript</title>
+  <style>
+    html, body { height: 100%; }
+    body { margin: 0; background: #111; color: #ddd; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #root { min-height: 100%; max-width: 1000px; margin: 0 auto; padding: 12px; }
+    .header { position: sticky; top: 0; background: #111; padding: 8px 0; font-weight: 700; z-index: 1; }
+    ol { list-style: none; padding: 0; margin: 0; }
+    li { padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    img { max-width: 100%; height: auto; }
+    a { color: #9ab; }
+    .meta { color: #aaa; font-size: 12px; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="header" id="title">Captured Chat Transcript</div>
+    <ol id="list"></ol>
+  </div>
+  <script src="transcript.js"></script>
+</body>
+</html>
+
