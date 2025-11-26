@@ -174,10 +174,65 @@ async function ensureOffscreen() {
 
 async function captureChatHistory(tab) {
   try {
+    // Check if tab is still valid before proceeding
+    if (!tab || !tab.id) {
+      throw new Error('Tab is invalid or has been closed');
+    }
+    
     // 1) Auto-scroll to buffer messages into window.__sf_capturedMessages
-    await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: false }, func: autoScrollDiscordHistory, args: [0, 900, 12, true] });
-    // 2) Merge buffered messages back into the live Discord DOM to preserve layout
-    const [{ result: mergeRes }] = await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: false }, func: mergeBufferedMessagesIntoDiscordPage });
+    // Parameters: maxMessages (10000 = stop after 10k messages), settleMs (1200ms for better lazy loading), maxNoNew (more lenient), untilTop (true)
+    let scrollResult;
+    try {
+      const results = await chrome.scripting.executeScript({ 
+        target: { tabId: tab.id, allFrames: false }, 
+        func: autoScrollDiscordHistory, 
+        args: [300, 1200, 15, true] 
+      });
+      scrollResult = results && results[0] ? results[0].result : null;
+    } catch (e) {
+      if (e.message && e.message.includes('Frame with ID') && e.message.includes('was removed')) {
+        throw new Error('Tab was closed or navigated away during capture');
+      }
+      throw e;
+    }
+    
+    if (scrollResult && !scrollResult.ok) {
+      console.warn('[ChatGrabber] Scroll failed, attempting fallback');
+    }
+    
+    // Check tab validity again before continuing
+    try {
+      await chrome.tabs.get(tab.id);
+    } catch (e) {
+      throw new Error('Tab was closed or navigated away during capture');
+    }
+    
+    // 2) Merge all cached messages into the DOM (no scrolling - just insert)
+    let mergeRes;
+    try {
+      const results = await chrome.scripting.executeScript({ 
+        target: { tabId: tab.id, allFrames: false }, 
+        func: mergeBufferedMessagesIntoDiscordPage 
+      });
+      mergeRes = results && results[0] ? results[0].result : null;
+    } catch (e) {
+      if (e.message && e.message.includes('Frame with ID') && e.message.includes('was removed')) {
+        throw new Error('Tab was closed or navigated away during capture');
+      }
+      console.warn('[ChatGrabber] Error merging messages:', e);
+    }
+    
+    if (mergeRes) {
+      console.log(`[ChatGrabber] Merged ${mergeRes.inserted || 0} messages, total: ${mergeRes.totalMessages || 0}`);
+    }
+    
+    // Check tab validity again
+    try {
+      await chrome.tabs.get(tab.id);
+    } catch (e) {
+      throw new Error('Tab was closed or navigated away during capture');
+    }
+    
     // 3) Apply media toggles if enabled
     const conf = await chrome.storage.local.get([DISABLE_PHOTOS_KEY, DISABLE_GIFS_KEY]);
     const disablePhotos = !!conf[DISABLE_PHOTOS_KEY];
@@ -186,6 +241,7 @@ async function captureChatHistory(tab) {
     if (didStrip) {
       try { await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: stripMediaInPage, args: [disablePhotos, disableGifs] }); } catch {}
     }
+    
     // 4) Capture the same tab as MHTML (keeps Discord layout)
     const blob = await chrome.pageCapture.saveAsMHTML({ tabId: tab.id });
     const { siteName, username } = await getSiteAndUsername(tab.id);
@@ -194,18 +250,35 @@ async function captureChatHistory(tab) {
     const base64 = arrayBufferToBase64(bytes);
     const dataUrl = `data:multipart/related;base64,${base64}`;
     await chrome.downloads.download({ url: dataUrl, filename, saveAs: true });
+    
     // 5) Restore media if we stripped
     if (didStrip) {
       try { await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: restoreMediaInPage }); } catch {}
     }
   } catch (e) {
     console.error('Chat history capture failed', e);
-    // Fallback: transcript page flow
-    try { await renderTranscriptInExtensionAndCapture(tab); } catch {}
+    
+    // Only try fallback if tab is still valid and error isn't about tab being closed
+    if (tab && tab.id && !e.message?.includes('Tab was closed') && !e.message?.includes('Frame with ID')) {
+      try {
+        // Check if we can still access the tab
+        await chrome.tabs.get(tab.id);
+        await renderTranscriptInExtensionAndCapture(tab);
+      } catch (fallbackError) {
+        // If fallback also fails (e.g., permission issues), just log it
+        if (fallbackError.message?.includes('permission') || fallbackError.message?.includes('Cannot access')) {
+          console.warn('[ChatGrabber] Fallback failed due to permissions. Please ensure the extension has access to the page.');
+        } else {
+          console.error('[ChatGrabber] Fallback also failed:', fallbackError);
+        }
+      }
+    } else {
+      console.warn('[ChatGrabber] Cannot use fallback - tab was closed or navigated away');
+    }
   }
 }
 
-function autoScrollDiscordHistory(maxMs, settleMs, maxNoNew, untilTop) {
+function autoScrollDiscordHistory(maxMessages, settleMs, maxNoNew, untilTop) {
   function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
   function isScrollable(el) {
     if (!el) return false; const cs = getComputedStyle(el); const canY = /(auto|scroll)/.test(cs.overflowY); return canY && el.scrollHeight > el.clientHeight;
@@ -244,15 +317,41 @@ function autoScrollDiscordHistory(maxMs, settleMs, maxNoNew, untilTop) {
   }
   function getOrderFromEl(el, idx) {
     try {
+      // Priority 1: Extract timestamp from time element (most accurate)
+      const t = el.querySelector('time[datetime]');
+      if (t && t.getAttribute('datetime')) {
+        const timestamp = Date.parse(t.getAttribute('datetime'));
+        if (!isNaN(timestamp) && timestamp > 0) {
+          return BigInt(timestamp);
+        }
+      }
+      
+      // Priority 2: Extract timestamp from Discord message ID (snowflake format)
       const idAttr = el.getAttribute('data-list-item-id') || el.id || el.getAttribute('data-message-id');
       if (idAttr) {
-        const m = String(idAttr).match(/(\d{6,})/);
-        if (m) return BigInt(m[1]);
+        // Discord message IDs are 17-19 digits and contain timestamp
+        const m = String(idAttr).match(/(\d{17,})/);
+        if (m) {
+          const msgId = BigInt(m[1]);
+          // Discord snowflake: (id >> 22) + 1420070400000
+          const timestamp = (msgId >> 22n) + 1420070400000n;
+          if (timestamp > 0n && timestamp < BigInt(Date.now() + 86400000)) {
+            return timestamp;
+          }
+        }
+        // Fallback: use the ID number directly if it's a reasonable timestamp
+        const m2 = String(idAttr).match(/(\d{6,})/);
+        if (m2) {
+          const idNum = BigInt(m2[1]);
+          // If it looks like a timestamp (after year 2000), use it
+          if (idNum > 946684800000n) { // 2000-01-01
+            return idNum;
+          }
+        }
       }
-      const t = el.querySelector('time[datetime]');
-      if (t && t.getAttribute('datetime')) return BigInt(Date.parse(t.getAttribute('datetime')) || 0);
     } catch {}
-    return BigInt(1e12 + idx); // fallback monotonic-ish
+    // Fallback: use sequence number with large offset to ensure it's at the end
+    return BigInt(Date.now() + idx); // fallback using current time + index
   }
   function isPlaceholder(el) {
     const role = el.getAttribute('role');
@@ -260,8 +359,14 @@ function autoScrollDiscordHistory(maxMs, settleMs, maxNoNew, untilTop) {
     if (el.getAttribute('aria-busy') === 'true') return true;
     const cls = el.className || '';
     if (/skeleton|placeholder|spinner|loading/i.test(cls)) return true;
-    const hasContent = !!el.querySelector('img, video, time, a, span, p, article, div[class*="message"]');
-    if (!hasContent && (el.textContent||'').trim() === '') return true;
+    // Check for empty or minimal content
+    const textContent = (el.textContent || '').trim();
+    if (!textContent && !el.querySelector('img, video, iframe, embed')) return true;
+    // Check for Discord skeleton patterns
+    const hasContent = !!el.querySelector('img, video, time, a, span, p, article, div[class*="message"], div[class*="content"]');
+    if (!hasContent && textContent === '') return true;
+    // Check for specific Discord loading indicators
+    if (el.querySelector('[class*="skeleton"], [class*="loading"], [class*="spinner"]')) return true;
     return false;
   }
   function scrollToBottom(scroller) {
@@ -271,7 +376,15 @@ function autoScrollDiscordHistory(maxMs, settleMs, maxNoNew, untilTop) {
     return new Promise((resolve) => {
       const start = Date.now();
       let lastMutationTs = Date.now();
-      const obs = new MutationObserver(() => { lastMutationTs = Date.now(); });
+      let lastMessageCount = countMessages();
+      const obs = new MutationObserver(() => { 
+        lastMutationTs = Date.now();
+        const currentCount = countMessages();
+        if (currentCount !== lastMessageCount) {
+          lastMessageCount = currentCount;
+          lastMutationTs = Date.now(); // Reset timer when new messages appear
+        }
+      });
       obs.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
       const tick = () => {
         const now = Date.now();
@@ -282,107 +395,1230 @@ function autoScrollDiscordHistory(maxMs, settleMs, maxNoNew, untilTop) {
       tick();
     });
   }
+  // Intercept console.log to detect Discord batch loading
+  let batchLoadDetected = false;
+  const originalConsoleLog = console.log;
+  const consoleInterceptor = function(...args) {
+    const message = args.join(' ');
+    if (message.includes('Fetched 50 messages') || message.includes('isBefore:true')) {
+      batchLoadDetected = true;
+    }
+    originalConsoleLog.apply(console, args);
+  };
+  console.log = consoleInterceptor;
+  
   return (async () => {
-    const start = Date.now(); let noNew = 0; const scroller = findScroller(); if (!scroller) return { ok:false };
+    try {
+      // Initialize persistent cache if it doesn't exist
+      if (!window.__sf_capturedMessagesRecords) {
+        window.__sf_capturedMessagesRecords = [];
+      }
+      if (!window.__sf_capturedMessagesCache) {
+        window.__sf_capturedMessagesCache = new Map();
+      }
+      
+      let noNew = 0; 
+      let noScrollChange = 0;
+      const scroller = findScroller(); 
+      if (!scroller) {
+        return { ok:false };
+      }
+      
     // Ensure we start from the very bottom (newest)
     scrollToBottom(scroller);
-    await waitForQuiet(Math.max(400, settleMs), 4000);
-    let lastCount = countMessages(); const captured = new Map(); let seq = 0;
+      await waitForQuiet(Math.max(600, settleMs), 5000);
+      
+      let lastCount = countMessages(); 
+      let lastScrollTop = scroller.scrollTop;
+      const captured = window.__sf_capturedMessagesCache; // Use persistent cache
+      let seq = captured.size; // Continue sequence from existing cache
+      
     function harvest() {
+        try {
       const nodes = selectVisible();
+          let newMessages = 0;
+          let topmostNewMessage = null;
+          let topmostOrder = null;
+          let topmostVisibleMessage = null;
+          let topmostVisibleOrder = null;
+          
       nodes.forEach((el, idx) => {
-        const key = getKey(el, idx); if (!key || captured.has(key)) return;
+            try {
+              // Check if element is still valid and connected to DOM
+              if (!el || !el.parentNode || (!el.isConnected && !document.contains(el))) {
+                return;
+              }
+              
+              const key = getKey(el, idx); 
+              const order = getOrderFromEl(el, idx);
+              
+              // Track the topmost visible message (for scrolling)
+              if (!isPlaceholder(el) && (!topmostVisibleOrder || order < topmostVisibleOrder)) {
+                topmostVisibleOrder = order;
+                topmostVisibleMessage = el;
+              }
+              
+              // Only capture if not already captured and not a placeholder
+              if (!key || captured.has(key)) return;
         if (isPlaceholder(el)) return;
+              
         const clone = el.cloneNode(true);
-        try { clone.querySelectorAll('[data-src]').forEach(n=>{ if(!n.getAttribute('src')) n.setAttribute('src', n.getAttribute('data-src')); }); } catch {}
-        try { clone.querySelectorAll('[data-srcset]').forEach(n=>{ if(!n.getAttribute('srcset')) n.setAttribute('srcset', n.getAttribute('data-srcset')); }); } catch {}
-        const order = getOrderFromEl(el, idx);
+              
+              // Capture image/GIF URLs directly from attributes (no waiting for load)
+              try {
+                // Get all media elements from original to extract URLs
+                const originalImgs = Array.from(el.querySelectorAll('img'));
+                const originalVideos = Array.from(el.querySelectorAll('video'));
+                const originalEmbeds = Array.from(el.querySelectorAll('embed, iframe'));
+                
+                // Handle lazy-loaded images - just grab the URL from data attributes
+                clone.querySelectorAll('[data-src]').forEach(n => {
+                  const dataSrc = n.getAttribute('data-src');
+                  if (dataSrc && !n.getAttribute('src')) {
+                    n.setAttribute('src', dataSrc);
+                    n.removeAttribute('data-src');
+                  }
+                });
+                
+                // Handle lazy-loaded srcset
+                clone.querySelectorAll('[data-srcset]').forEach(n => {
+                  const dataSrcset = n.getAttribute('data-srcset');
+                  if (dataSrcset && !n.getAttribute('srcset')) {
+                    n.setAttribute('srcset', dataSrcset);
+                    n.removeAttribute('data-srcset');
+                  }
+                });
+                
+                // For all img elements, grab URL from any available source
+                clone.querySelectorAll('img').forEach((cloneImg, idx) => {
+                  // Try to match with original image
+                  const originalImg = originalImgs[idx] || 
+                                     originalImgs.find(orig => 
+                                       orig.alt === cloneImg.getAttribute('alt') ||
+                                       orig.getAttribute('data-src') === cloneImg.getAttribute('data-src') ||
+                                       orig.className === cloneImg.className
+                                     );
+                  
+                  // Priority: data-src > src > currentSrc > original src
+                  let imageUrl = null;
+                  
+                  if (originalImg) {
+                    // Check original's data-src first (lazy-load URL)
+                    imageUrl = originalImg.getAttribute('data-src') || 
+                              originalImg.getAttribute('data-lazy-src') || 
+                              originalImg.getAttribute('data-original') ||
+                              originalImg.getAttribute('data-lazy') ||
+                              (originalImg.src && originalImg.src !== 'about:blank' ? originalImg.src : null) ||
+                              (originalImg.currentSrc || null);
+                  }
+                  
+                  // Fallback: check clone's own attributes
+                  if (!imageUrl) {
+                    imageUrl = cloneImg.getAttribute('data-src') || 
+                              cloneImg.getAttribute('data-lazy-src') || 
+                              cloneImg.getAttribute('data-original') ||
+                              cloneImg.getAttribute('data-lazy') ||
+                              cloneImg.getAttribute('src');
+                  }
+                  
+                  // Set the URL if we found one
+                  if (imageUrl && imageUrl !== 'about:blank') {
+                    cloneImg.setAttribute('src', imageUrl);
+                  }
+                  
+                  // Also copy srcset if available
+                  if (originalImg && originalImg.srcset) {
+                    cloneImg.setAttribute('srcset', originalImg.srcset);
+                  }
+                });
+                
+                // Handle video elements - grab URLs
+                clone.querySelectorAll('video').forEach((cloneVideo, idx) => {
+                  const originalVideo = originalVideos[idx] || originalVideos[0];
+                  if (originalVideo) {
+                    const videoUrl = originalVideo.getAttribute('data-src') || 
+                                   originalVideo.src || 
+                                   originalVideo.currentSrc;
+                    if (videoUrl && !cloneVideo.getAttribute('src')) {
+                      cloneVideo.setAttribute('src', videoUrl);
+                    }
+                    // Copy poster image URL
+                    if (originalVideo.poster && !cloneVideo.getAttribute('poster')) {
+                      cloneVideo.setAttribute('poster', originalVideo.poster);
+                    }
+                    // Copy source elements
+                    originalVideo.querySelectorAll('source').forEach(origSource => {
+                      const cloneSource = cloneVideo.querySelector(`source[type="${origSource.getAttribute('type')}"]`);
+                      if (cloneSource) {
+                        const sourceUrl = origSource.getAttribute('data-src') || origSource.src;
+                        if (sourceUrl) {
+                          cloneSource.setAttribute('src', sourceUrl);
+                        }
+                      }
+                    });
+                  }
+                });
+                
+                // Handle embed/iframe elements - grab URLs
+                clone.querySelectorAll('embed, iframe').forEach((cloneEmbed, idx) => {
+                  const originalEmbed = originalEmbeds[idx] || 
+                                       originalEmbeds.find(orig => orig.tagName === cloneEmbed.tagName);
+                  if (originalEmbed) {
+                    const embedUrl = originalEmbed.getAttribute('data-src') || 
+                                   originalEmbed.src;
+                    if (embedUrl && !cloneEmbed.getAttribute('src')) {
+                      cloneEmbed.setAttribute('src', embedUrl);
+                    }
+                  }
+                });
+                
+                // Handle Discord's attachment containers - grab URLs from nested media
+                clone.querySelectorAll('[class*="attachment"], [class*="imageWrapper"], [class*="media"], [class*="embed"]').forEach(container => {
+                  const containerClasses = container.className.split(' ').filter(c => c);
+                  const originalContainer = containerClasses.length > 0 
+                    ? el.querySelector(`.${containerClasses[0]}`) 
+                    : null;
+                  
+                  if (originalContainer) {
+                    // Copy image URLs from original container
+                    originalContainer.querySelectorAll('img').forEach(origImg => {
+                      const cloneImg = container.querySelector('img');
+                      if (cloneImg) {
+                        const imgUrl = origImg.getAttribute('data-src') || 
+                                     (origImg.src && origImg.src !== 'about:blank' ? origImg.src : null) ||
+                                     origImg.currentSrc;
+                        if (imgUrl && !cloneImg.getAttribute('src')) {
+                          cloneImg.setAttribute('src', imgUrl);
+                        }
+                      }
+                    });
+                    
+                    // Copy background images
+                    const bgImage = window.getComputedStyle(originalContainer).backgroundImage;
+                    if (bgImage && bgImage !== 'none') {
+                      container.style.backgroundImage = bgImage;
+                    }
+                  }
+                });
+              } catch (mediaErr) {
+                console.warn('[ChatGrabber] Error processing media:', mediaErr);
+              }
+              
         captured.set(key, { html: clone.outerHTML, seq: seq++, order: order.toString(), key });
-      });
-    }
-    // Main loop: move upward in small increments and wait for DOM to settle
-    const deadline = maxMs && maxMs > 0 ? (start + maxMs) : Infinity;
-    while (Date.now() < deadline) {
-      try {
-        const step = Math.max(150, Math.floor(scroller.clientHeight*0.8));
+              newMessages++;
+              
+              // Track the topmost (oldest) newly captured message
+              if (!topmostOrder || order < topmostOrder) {
+                topmostOrder = order;
+                topmostNewMessage = el;
+              }
+            } catch (e) {
+              // Skip this element if there's an error processing it
+              console.warn('[ChatGrabber] Error processing message element:', e);
+            }
+          });
+          
+          // Update persistent cache immediately
+          window.__sf_capturedMessagesRecords = Array.from(captured.values());
+          window.__sf_capturedMessages = window.__sf_capturedMessagesRecords.map(v=>v.html);
+          
+          // Return topmost new message if available, otherwise topmost visible message
+          return { 
+            newMessages, 
+            topmostNewMessage: topmostNewMessage || topmostVisibleMessage 
+          };
+        } catch (e) {
+          console.error('[ChatGrabber] Error in harvest function:', e);
+          return { newMessages: 0, topmostNewMessage: null };
+        }
+      }
+      
+      function isAtTopOfChat() {
+        // Check if we can see the "This is the beginning of your direct message history with" text
+        try {
+          // First check the message container specifically
+          const list = document.querySelector('ol[data-list-id="chat-messages"]');
+          const log = document.querySelector('[role="log"]');
+          const container = list || log;
+          
+          if (container) {
+            // Check first few children of message container
+            const children = Array.from(container.children).slice(0, 3);
+            for (const child of children) {
+              const text = (child.textContent || '').toLowerCase();
+              if (text.includes('this is the beginning of your direct message history with') ||
+                  text.includes('beginning of your direct message history') ||
+                  text.includes('beginning of your direct message')) {
+                console.log('[ChatGrabber] Found "beginning" text in message container - at top');
+                return true;
+              }
+            }
+            
+            // Check all text in container
+            const containerText = (container.textContent || '').toLowerCase();
+            if (containerText.includes('this is the beginning of your direct message history with') ||
+                containerText.includes('beginning of your direct message history')) {
+              console.log('[ChatGrabber] Found "beginning" text in container - at top');
+              return true;
+            }
+          }
+          
+          // Check visible elements in viewport
+          const visibleElements = Array.from(document.querySelectorAll('*')).filter(el => {
+            try {
+              const rect = el.getBoundingClientRect();
+              return rect.top >= 0 && rect.top < window.innerHeight && 
+                     rect.left >= 0 && rect.left < window.innerWidth &&
+                     rect.width > 0 && rect.height > 0;
+            } catch {
+              return false;
+            }
+          });
+          
+          for (const el of visibleElements) {
+            const text = (el.textContent || '').toLowerCase();
+            if (text.includes('this is the beginning of your direct message history with') ||
+                text.includes('beginning of your direct message history') ||
+                (text.includes('beginning') && text.includes('direct message'))) {
+              console.log('[ChatGrabber] Found "beginning" text in visible element - at top');
+              return true;
+            }
+          }
+          
+          // Check document body as fallback
+          const allText = (document.body.textContent || document.body.innerText || '').toLowerCase();
+          if (allText.includes('this is the beginning of your direct message history with') ||
+              allText.includes('beginning of your direct message history')) {
+            console.log('[ChatGrabber] Found "beginning" text in body - at top');
+            return true;
+          }
+        } catch (e) {
+          console.warn('[ChatGrabber] Error checking if at top:', e);
+        }
+        return false;
+      }
+      
+      function scrollToMessage(messageEl) {
+        if (!messageEl) return false;
+        
+        // Check if element is still in the document
+        if (!document.contains(messageEl) && !messageEl.isConnected) {
+          return false;
+        }
+        
+        try {
+          // Try to get the message's position - this can fail if element is detached
+          let messageRect, scrollerRect;
+          try {
+            messageRect = messageEl.getBoundingClientRect();
+            scrollerRect = scroller.getBoundingClientRect();
+          } catch (e) {
+            // If getBoundingClientRect fails, try alternative approach
+            try {
+              const currentScrollTop = scroller.scrollTop;
+              const messageOffsetTop = messageEl.offsetTop;
+              if (messageOffsetTop !== undefined) {
+                const targetScrollTop = Math.max(0, messageOffsetTop - 100);
+                scroller.scrollTop = targetScrollTop;
+                scroller.dispatchEvent(new WheelEvent('wheel', { 
+                  deltaY: -150, 
+                  bubbles: true, 
+                  cancelable: true 
+                }));
+                return true;
+              }
+            } catch (e2) {
+              return false;
+            }
+            return false;
+          }
+          
+          // Calculate scroll position to put message near the top of viewport
+          const currentScrollTop = scroller.scrollTop;
+          const messageOffsetTop = messageEl.offsetTop || (messageRect.top - scrollerRect.top + currentScrollTop);
+          const targetScrollTop = Math.max(0, messageOffsetTop - 100); // 100px from top to trigger loading
+          
+          // Scroll to the message position
+          scroller.scrollTop = targetScrollTop;
+          
+          // Try scrollIntoView, but catch any DOMException
+          try {
+            messageEl.scrollIntoView({ behavior: 'instant', block: 'start' });
+          } catch (scrollError) {
+            // scrollIntoView can throw DOMException in some cases, just continue without it
+            console.warn('[ChatGrabber] scrollIntoView failed, using scrollTop only:', scrollError);
+          }
+          
+          // Dispatch multiple events to trigger Discord's lazy loading
+          try {
+            scroller.dispatchEvent(new WheelEvent('wheel', { 
+              deltaY: -150, 
+              bubbles: true, 
+              cancelable: true 
+            }));
+            
+            // Also dispatch scroll event
+            scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+          } catch (eventError) {
+            // Event dispatch can fail in some contexts, but scrollTop should still work
+            console.warn('[ChatGrabber] Event dispatch failed:', eventError);
+          }
+          
+          return true;
+        } catch (e) {
+          console.warn('[ChatGrabber] Error scrolling to message:', e);
+          return false;
+        }
+      }
+      
+      // Capture profile header at the beginning
+      async function captureProfileHeader() {
+        try {
+          // Scroll to top first to ensure profile header is visible
+          scroller.scrollTop = 0;
+          await wait(800);
+          
+          // Look for profile header with multiple strategies
+          let profileElement = null;
+          
+          // Strategy 1: Check message container first (most reliable)
+          const list = document.querySelector('ol[data-list-id="chat-messages"]');
+          const log = document.querySelector('[role="log"]');
+          const container = list || log;
+          
+          if (container) {
+            // Check first few children of message container
+            const children = Array.from(container.children);
+            for (const child of children.slice(0, 5)) {
+              const text = (child.textContent || '').toLowerCase();
+              if (text.includes('this is the beginning of your direct message history with') ||
+                  text.includes('beginning of your direct message history') ||
+                  text.includes('beginning of your direct message') ||
+                  text.includes('this is the beginning')) {
+                profileElement = child;
+                console.log('[ChatGrabber] Found profile header in message container (first child)');
+                break;
+              }
+              
+              // Also check if it has avatar or profile indicators
+              if (child.querySelector('img[class*="avatar"], img[alt*="avatar"], img[class*="Avatar"]') ||
+                  child.querySelector('[class*="profile"], [class*="empty"], [class*="emptyState"]')) {
+                const childText = (child.textContent || '').toLowerCase();
+                if (childText.includes('beginning') || childText.includes('mutual') || childText.includes('server')) {
+                  profileElement = child;
+                  console.log('[ChatGrabber] Found profile header in message container (has avatar/profile)');
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Strategy 2: Look for text content "beginning of your direct message" in all elements
+          if (!profileElement) {
+            const allElements = document.querySelectorAll('*');
+            for (const el of allElements) {
+              const text = (el.textContent || '').toLowerCase();
+              if (text.includes('this is the beginning of your direct message history with') ||
+                  text.includes('beginning of your direct message history')) {
+                // Find the parent container that likely contains the full profile area
+                let parent = el.parentElement;
+                let candidate = el;
+                for (let i = 0; i < 8 && parent; i++) {
+                  if (parent.querySelector('img[class*="avatar"], img[alt*="avatar"], img[class*="Avatar"]') ||
+                      parent.querySelector('[class*="profile"], [class*="emptyState"], [class*="empty"]')) {
+                    candidate = parent;
+                    break;
+                  }
+                  parent = parent.parentElement;
+                }
+                profileElement = candidate;
+                console.log('[ChatGrabber] Found profile header via text search');
+                break;
+              }
+            }
+          }
+          
+          // Strategy 3: Look for empty state containers
+          if (!profileElement) {
+            const emptySelectors = [
+              '[class*="emptyState"]',
+              '[class*="emptyChannel"]',
+              '[class*="emptyStateWrapper"]',
+              '[class*="emptyChannelIcon"]',
+              'div[class*="empty"]',
+              'section[class*="empty"]'
+            ];
+            
+            for (const selector of emptySelectors) {
+              const elements = document.querySelectorAll(selector);
+              for (const el of elements) {
+                const text = (el.textContent || '').toLowerCase();
+                if (text.includes('beginning') || 
+                    text.includes('direct message') ||
+                    el.querySelector('img[class*="avatar"], img[alt*="avatar"], img[class*="Avatar"]')) {
+                  profileElement = el;
+                  console.log('[ChatGrabber] Found profile header via empty state selector');
+                  break;
+                }
+              }
+              if (profileElement) break;
+            }
+          }
+          
+          // Strategy 4: Look for large avatar/profile images at the top
+          if (!profileElement) {
+            const largeAvatars = Array.from(document.querySelectorAll('img[class*="avatar"], img[alt*="avatar"], img[class*="Avatar"]'))
+              .filter(img => {
+                try {
+                  const rect = img.getBoundingClientRect();
+                  return rect.width > 80 && rect.height > 80; // Large avatar
+                } catch {
+                  return false;
+                }
+              });
+            
+            if (largeAvatars.length > 0) {
+              const largeAvatar = largeAvatars[0];
+              let parent = largeAvatar.parentElement;
+              for (let i = 0; i < 15 && parent; i++) {
+                const text = (parent.textContent || '').toLowerCase();
+                if (text.includes('beginning') || 
+                    text.includes('direct message') || 
+                    text.includes('mutual') ||
+                    text.includes('server')) {
+                  profileElement = parent;
+                  console.log('[ChatGrabber] Found profile header via large avatar');
+                  break;
+                }
+                parent = parent.parentElement;
+              }
+            }
+          }
+          
+          if (profileElement) {
+            const clone = profileElement.cloneNode(true);
+            // Ensure profile images have URLs
+            clone.querySelectorAll('img').forEach(img => {
+              const originalImg = profileElement.querySelector(`img[alt="${img.getAttribute('alt')}"]`) ||
+                                Array.from(profileElement.querySelectorAll('img')).find(orig => 
+                                  orig.className === img.className ||
+                                  orig.getAttribute('src') === img.getAttribute('src')
+                                );
+              if (originalImg) {
+                const imgUrl = originalImg.getAttribute('data-src') || 
+                              originalImg.getAttribute('src') ||
+                              originalImg.currentSrc;
+                if (imgUrl && imgUrl !== 'about:blank') {
+                  img.setAttribute('src', imgUrl);
+                }
+              }
+            });
+            const profileKey = 'sf-profile-header';
+            if (!captured.has(profileKey)) {
+              captured.set(profileKey, { 
+                html: clone.outerHTML, 
+                seq: -1, // Special sequence for profile header
+                order: '0', // Oldest order
+                key: profileKey 
+              });
+              console.log('[ChatGrabber] Successfully captured profile header:', profileElement.className);
+            } else {
+              console.log('[ChatGrabber] Profile header already captured');
+            }
+          } else {
+            console.warn('[ChatGrabber] Could not find profile header element - tried all strategies');
+          }
+        } catch (e) {
+          console.warn('[ChatGrabber] Error capturing profile header:', e);
+        }
+      }
+      
+      // Capture profile header before starting
+      await captureProfileHeader();
+      
+      // Initial harvest
+      const initialHarvest = harvest();
+      let topmostMessage = initialHarvest.topmostNewMessage;
+      let prevCachedCount = captured.size;
+      let noChangeCount = 0;
+      let topCheckCount = 0; // Track how many times we've checked at top
+      
+      // Main loop: scroll to last captured message to trigger next batch
+      const maxMsgLimit = maxMessages && maxMessages > 0 ? maxMessages : Infinity;
+      let iterations = 0;
+      
+      while (captured.size < maxMsgLimit) {
+        iterations++;
+        batchLoadDetected = false;
+        
+        const prevScrollTop = scroller.scrollTop;
+        const prevMessageCount = countMessages();
+        const currentCachedCount = captured.size;
+        
+        // Check if we're actually at the top of the chat
+        const isAtTop = scroller.scrollTop <= 1 || isAtTopOfChat();
+        
+        // Scroll to the topmost captured message to force Discord to load next batch
+        try {
+          if (isAtTop) {
+            // If we're at the top, capture profile header and scroll to absolute top
+            await captureProfileHeader();
+            scroller.scrollTop = 0;
+            scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -50, bubbles:true, cancelable:true }));
+            scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+            console.log(`[ChatGrabber] At top of chat, scrolling to absolute top`);
+          } else if (topmostMessage) {
+            const scrolled = scrollToMessage(topmostMessage);
+            if (scrolled) {
+              console.log(`[ChatGrabber] Scrolled to topmost message to trigger next batch`);
+            }
+          } else {
+            // Fallback: scroll up a small amount
+            try {
+              const step = Math.min(200, Math.max(100, Math.floor(scroller.clientHeight * 0.3)));
         scroller.scrollTop = Math.max(0, scroller.scrollTop - step);
         scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -step, bubbles:true, cancelable:true }));
-      } catch {}
-      await waitForQuiet(Math.max(350, settleMs), 3000);
-      harvest();
+            } catch (scrollErr) {
+              console.warn('[ChatGrabber] Fallback scroll failed:', scrollErr);
+            }
+          }
+        } catch (scrollError) {
+          console.warn('[ChatGrabber] Error during scroll operation:', scrollError);
+          // Continue with the loop even if scroll fails
+        }
+        
+        // Wait for messages to load, with detection for batch loading
+        await waitForQuiet(Math.max(600, settleMs), 5000);
+        
+        // If we detected a batch load, wait a bit more for it to fully render
+        if (batchLoadDetected) {
+          await wait(300);
+        }
+        
+        // Harvest new messages (no need to wait for media to load - we grab URLs directly)
+        const harvestResult = harvest();
+        const newMessages = harvestResult.newMessages;
       const now = countMessages();
-      noNew = (now <= lastCount) ? noNew+1 : 0; lastCount = now;
+        const currentScrollTop = scroller.scrollTop;
+        
+        // Update topmost message if we captured new ones
+        if (harvestResult.topmostNewMessage) {
+          topmostMessage = harvestResult.topmostNewMessage;
+        }
+        
+        // Check if cached message count stayed the same (stuck)
+        if (captured.size === prevCachedCount && !isAtTop) {
+          noChangeCount++;
+          if (noChangeCount >= 2) {
+            // Give it a "bump" - do a normal scroll up
+            console.log(`[ChatGrabber] Message count unchanged (${captured.size}), giving a scroll bump`);
+            try {
+              const bumpStep = Math.min(300, Math.max(150, Math.floor(scroller.clientHeight * 0.5)));
+              scroller.scrollTop = Math.max(0, scroller.scrollTop - bumpStep);
+              scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -bumpStep, bubbles:true, cancelable:true }));
+              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              await wait(500); // Wait a bit longer after the bump
+              const bumpHarvest = harvest(); // Harvest again after bump
+              if (bumpHarvest.newMessages > 0) {
+                noChangeCount = 0; // Reset if bump worked
+                if (bumpHarvest.topmostNewMessage) {
+                  topmostMessage = bumpHarvest.topmostNewMessage;
+                }
+              } else if (noChangeCount >= 5) {
+                // If we've tried 5 times with no change, check if we're at the top
+                const atTopText = isAtTopOfChat();
+                if (atTopText) {
+                  console.log(`[ChatGrabber] Found "beginning of direct message" text - we're at the top. Captured ${captured.size} messages.`);
+                  // Scroll to top and do final harvest
+                  scroller.scrollTop = 0;
+                  await wait(500);
+                  harvest();
+                  // Normal scroll up
+                  scroller.scrollTop = 0;
+                  await wait(200);
+                  break;
+                } else {
+                  // If we've tried 5 times with no change and not at top, we're truly stuck - break
+                  console.log(`[ChatGrabber] Stuck after ${noChangeCount} attempts, breaking. Captured ${captured.size} messages.`);
+                  break;
+                }
+              }
+            } catch (bumpErr) {
+              console.warn('[ChatGrabber] Bump scroll failed:', bumpErr);
+              if (noChangeCount >= 5) {
+                // Check if we're at top before breaking
+                const atTopText = isAtTopOfChat();
+                if (atTopText) {
+                  console.log(`[ChatGrabber] Found "beginning of direct message" text - we're at the top. Captured ${captured.size} messages.`);
+                  scroller.scrollTop = 0;
+                  await wait(500);
+                  harvest();
+                  scroller.scrollTop = 0;
+                  await wait(200);
+                  break;
+                } else {
+                  console.log(`[ChatGrabber] Too many failed attempts, breaking. Captured ${captured.size} messages.`);
+                  break;
+                }
+              }
+            }
+          }
+        } else {
+          noChangeCount = 0; // Reset counter if we got new messages
+        }
+        prevCachedCount = captured.size;
+        
+        // Check if scroll position changed
+        if (Math.abs(currentScrollTop - prevScrollTop) < 1) {
+          noScrollChange++;
+        } else {
+          noScrollChange = 0;
+        }
+        
+        // Check if new messages appeared
+        if (now <= lastCount && newMessages === 0) {
+          noNew++;
+        } else {
+          noNew = 0;
+          lastCount = now;
+        }
+        
+        // Progress logging
+        if (iterations % 5 === 0) {
+          console.log(`[ChatGrabber] Progress: ${captured.size}/${maxMsgLimit !== Infinity ? maxMsgLimit : '∞'} messages cached, scroll: ${Math.round(currentScrollTop)}, new: ${newMessages}, at top: ${isAtTop}`);
+          
+          // Send progress message with all currently cached elements
+          try {
+            const cachedArray = Array.from(captured.values()).map(rec => ({
+              key: rec.key,
+              order: rec.order,
+              seq: rec.seq,
+              html: rec.html
+            }));
+            
+            chrome.runtime.sendMessage({
+              type: 'SF_CHATGRABBER_PROGRESS',
+              progress: {
+                cached: captured.size,
+                total: maxMsgLimit !== Infinity ? maxMsgLimit : null,
+                scroll: Math.round(currentScrollTop),
+                new: newMessages,
+                atTop: isAtTop,
+                iterations: iterations
+              },
+              cachedMessages: cachedArray
+            }).catch(() => {
+              // Ignore errors if background script isn't listening
+            });
+          } catch (e) {
+            // Ignore errors sending progress message
+          }
+        }
+        
+        // Check if we've reached the message limit
+        if (captured.size >= maxMsgLimit) {
+          console.log(`[ChatGrabber] Reached message limit: ${captured.size} messages`);
+          break;
+        }
+        
       if (untilTop) {
-        if ((scroller.scrollTop||0) <= 0 && noNew >= 2) break; // top and stable twice
+          // At top and no new messages for multiple iterations, and scroll hasn't changed
+          if (isAtTop) {
+            topCheckCount++;
+            console.log(`[ChatGrabber] At top - check ${topCheckCount}/2`);
+            
+            // Capture profile header when at top
+            await captureProfileHeader();
+            
+            // Try scrolling to absolute top
+            scroller.scrollTop = 0;
+            await wait(1000);
+            const topHarvest = harvest();
+            
+            if (topHarvest.newMessages > 0) {
+              // Got new messages, reset counters
+              topCheckCount = 0;
+              noNew = 0;
+              noScrollChange = 0;
+              lastCount = countMessages();
+            } else if (topCheckCount >= 2) {
+              // Checked 2 times at top with no new messages - do final check then break
+              console.log(`[ChatGrabber] Checked at top 2 times, doing final check`);
+              await wait(1000);
+              const finalHarvest = harvest(); // Final harvest
+              if (finalHarvest.topmostNewMessage) {
+                topmostMessage = finalHarvest.topmostNewMessage;
+              }
+              const finalCount = countMessages();
+              if (finalCount === lastCount && finalHarvest.newMessages === 0) {
+                console.log(`[ChatGrabber] Confirmed at top with all messages (${captured.size} total)`);
+                // Do a normal scroll up before breaking
+                scroller.scrollTop = 0;
+                await wait(200);
+                break; // Confirmed at top with all messages
+              }
+              lastCount = finalCount;
+              noNew = 0;
+              topCheckCount = 0; // Reset for next iteration
+            }
+          } else {
+            // Not at top, reset top check count
+            topCheckCount = 0;
+            
+            if (noChangeCount >= 3 && Math.abs(currentScrollTop - prevScrollTop) < 5) {
+              // If we're not at top but haven't made progress in scroll or messages, we might be stuck
+              // Try scrolling to absolute top to see if there are more messages
+              console.log(`[ChatGrabber] Appears stuck, trying scroll to absolute top`);
+              scroller.scrollTop = 0;
+              await wait(1500);
+              const stuckHarvest = harvest();
+              if (stuckHarvest.newMessages === 0) {
+                console.log(`[ChatGrabber] No messages found at top, breaking. Captured ${captured.size} messages.`);
+                // Do a normal scroll up before breaking
+                scroller.scrollTop = 0;
+                await wait(200);
+                break;
+              } else {
+                noChangeCount = 0; // Reset if we found messages
+              }
+            }
+          }
       } else {
         if (noNew >= maxNoNew) break; // stopped growing
       }
+        
+        lastScrollTop = currentScrollTop;
     }
+      
+      // Final harvest to catch any remaining messages
     harvest();
+      
+      // Try to capture profile header one more time at the end
+      scroller.scrollTop = 0;
+      await wait(500);
+      captureProfileHeader();
+      await wait(300);
+      // Harvest again in case profile header triggered any new messages
+      harvest();
+      
+      // Sort all cached messages chronologically
     const records = Array.from(captured.values()).sort((a,b)=>{
-      try { return (BigInt(a.order) - BigInt(b.order)); } catch { return a.seq - b.seq; }
-    });
+        try { 
+          const orderA = BigInt(a.order);
+          const orderB = BigInt(b.order);
+          if (orderA < orderB) return -1;
+          if (orderA > orderB) return 1;
+          return 0;
+        } catch { return a.seq - b.seq; }
+      });
+      
+      // Update final cache
     window.__sf_capturedMessagesRecords = records;
-    window.__sf_capturedMessages = records.map(v=>v.html); // backward compat
+      window.__sf_capturedMessages = records.map(v=>v.html);
+      
+      console.log(`[ChatGrabber] Complete: ${records.length} messages cached`);
+      
+      // Just scroll normally to top (no message loading attempts)
+      try {
+        scroller.scrollTop = 0;
+      } catch {}
+      
     return { ok:true, loaded: records.length };
+    } catch (error) {
+      console.error('[ChatGrabber] Error during scroll:', error);
+      return { ok: false, error: String(error) };
+    } finally {
+      // Always restore original console.log
+      console.log = originalConsoleLog;
+    }
+  })();
+}
+
+function ensureAllMessagesInDOM() {
+  // Just scroll normally to top - no message loading attempts
+  return (async () => {
+    try {
+      function findScroller() {
+        const cands = [
+          document.querySelector('.messagesWrapper__36d07 .scroller__36d07'),
+          document.querySelector('div[class*="messagesWrapper"] div[class*="scroller"]'),
+          document.querySelector('[data-list-id="chat-messages"]'),
+          document.querySelector('[role="log"]'),
+          document.querySelector('main div[class*="scroller"]')
+        ].filter(Boolean);
+        for (const el of cands) {
+          const cs = getComputedStyle(el);
+          const canY = /(auto|scroll)/.test(cs.overflowY);
+          if (canY && el.scrollHeight > el.clientHeight) return el;
+        }
+        if (document.scrollingElement && document.scrollingElement.scrollHeight > document.scrollingElement.clientHeight) {
+          return document.scrollingElement;
+        }
+        return document.documentElement;
+      }
+      
+      function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+      
+      const scroller = findScroller();
+      if (!scroller) return;
+      
+      // Just scroll normally to top (no loading attempts)
+      scroller.scrollTop = 0;
+      await wait(200);
+    } catch (e) {
+      console.warn('[ChatGrabber] Error scrolling to top:', e);
+    }
   })();
 }
 
 function mergeBufferedMessagesIntoDiscordPage() {
-  try {
-    const records = Array.isArray(window.__sf_capturedMessagesRecords) ? window.__sf_capturedMessagesRecords : (window.__sf_capturedMessages || []).map((html, i)=>({ html, key: `k${i}`, order: String(1e15+i) }));
+  return (async () => {
+    try {
+    // Replace the entire message container with all cached messages
+    // This ensures all messages are in the DOM as if Discord loaded them all at once
+    
+    // First, capture the profile/header area at the beginning of the chat
+    function captureProfileHeader() {
+      try {
+        // Scroll to top to ensure profile header is visible
+        const scroller = document.querySelector('[data-list-id="chat-messages"]')?.closest('[class*="scroller"]') ||
+                        document.querySelector('[role="log"]')?.closest('[class*="scroller"]') ||
+                        document.querySelector('main div[class*="scroller"]');
+        if (scroller) {
+          scroller.scrollTop = 0;
+        }
+        
+        // Look for profile header with multiple strategies
+        let profileElement = null;
+        
+        // Strategy 1: Look for text content "beginning of your direct message"
+        const allElements = document.querySelectorAll('*');
+        for (const el of allElements) {
+          const text = (el.textContent || '').toLowerCase();
+          if (text.includes('beginning of your direct message') || 
+              text.includes('this is the beginning')) {
+            // Find the parent container that likely contains the full profile area
+            let parent = el.parentElement;
+            let candidate = el;
+            for (let i = 0; i < 5 && parent; i++) {
+              if (parent.querySelector('img[class*="avatar"], img[alt*="avatar"]') ||
+                  parent.querySelector('[class*="profile"], [class*="emptyState"]')) {
+                candidate = parent;
+                break;
+              }
+              parent = parent.parentElement;
+            }
+            profileElement = candidate;
+            break;
+          }
+        }
+        
+        // Strategy 2: Look for empty state containers
+        if (!profileElement) {
+          const emptySelectors = [
+            '[class*="emptyState"]',
+            '[class*="emptyChannel"]',
+            '[class*="emptyStateWrapper"]',
+            '[class*="emptyChannelIcon"]',
+            'div[class*="empty"]',
+            'section[class*="empty"]'
+          ];
+          
+          for (const selector of emptySelectors) {
+            const elements = document.querySelectorAll(selector);
+            for (const el of elements) {
+              const text = (el.textContent || '').toLowerCase();
+              if (text.includes('beginning') || 
+                  text.includes('direct message') ||
+                  el.querySelector('img[class*="avatar"], img[alt*="avatar"]')) {
+                profileElement = el;
+                break;
+              }
+            }
+            if (profileElement) break;
+          }
+        }
+        
+        // Strategy 3: Check message container first child
+        if (!profileElement) {
+          const list = document.querySelector('ol[data-list-id="chat-messages"]');
+          const log = document.querySelector('[role="log"]');
+          const container = list || log;
+          if (container) {
+            // Check first few children
+            const children = Array.from(container.children);
+            for (const child of children.slice(0, 5)) {
+              const text = (child.textContent || '').toLowerCase();
+              if (text.includes('beginning') || 
+                  text.includes('direct message') ||
+                  child.querySelector('img[class*="avatar"], img[alt*="avatar"]') ||
+                  child.querySelector('[class*="profile"], [class*="empty"]')) {
+                profileElement = child;
+                break;
+              }
+            }
+          }
+        }
+        
+        // Strategy 4: Look for large avatar/profile images at the top
+        if (!profileElement) {
+          const largeAvatars = Array.from(document.querySelectorAll('img[class*="avatar"], img[alt*="avatar"], img[class*="Avatar"]'))
+            .filter(img => {
+              const rect = img.getBoundingClientRect();
+              return rect.width > 80 && rect.height > 80; // Large avatar
+            });
+          
+          if (largeAvatars.length > 0) {
+            const largeAvatar = largeAvatars[0];
+            let parent = largeAvatar.parentElement;
+            for (let i = 0; i < 10 && parent; i++) {
+              const text = (parent.textContent || '').toLowerCase();
+              if (text.includes('beginning') || text.includes('direct message') || text.includes('mutual')) {
+                profileElement = parent;
+                break;
+              }
+              parent = parent.parentElement;
+            }
+          }
+        }
+        
+        if (profileElement) {
+          const clone = profileElement.cloneNode(true);
+          // Ensure profile images have their URLs
+          clone.querySelectorAll('img').forEach(img => {
+            const originalImg = profileElement.querySelector(`img[alt="${img.getAttribute('alt')}"]`) ||
+                              Array.from(profileElement.querySelectorAll('img')).find(orig => 
+                                orig.className === img.className ||
+                                orig.getAttribute('src') === img.getAttribute('src')
+                              );
+            if (originalImg) {
+              const imgUrl = originalImg.getAttribute('data-src') || 
+                            originalImg.getAttribute('src') ||
+                            originalImg.currentSrc;
+              if (imgUrl && imgUrl !== 'about:blank') {
+                img.setAttribute('src', imgUrl);
+              }
+            }
+          });
+          return clone.outerHTML;
+        }
+      } catch (e) {
+        console.warn('[ChatGrabber] Error capturing profile header:', e);
+      }
+      return null;
+    }
+    
+    const profileHeaderHtml = captureProfileHeader();
+    
     const list = document.querySelector('ol[data-list-id="chat-messages"]');
     const log = document.querySelector('[role="log"]');
     const container = list || log || document.querySelector('main');
     if (!container) return { ok: false, inserted: 0, title: document.title };
-    // Clean existing placeholders
-    Array.from(container.children).forEach((child) => {
+    
+    // Use the complete cached message set
+    const records = Array.isArray(window.__sf_capturedMessagesRecords) ? window.__sf_capturedMessagesRecords : (window.__sf_capturedMessages || []).map((html, i)=>({ html, key: `k${i}`, order: String(1e15+i) }));
+    
+    if (records.length === 0) {
+      console.warn('[ChatGrabber] No cached messages to merge');
+      return { ok: false, inserted: 0, title: document.title };
+    }
+    
+    // Sort cached records by absolute time (oldest first)
+    // Extract actual timestamps from HTML to ensure proper chronological sorting
+    function extractTimestamp(rec) {
+      try {
+        // Try to parse the order field first (should be timestamp or message ID)
+        const orderNum = BigInt(rec.order);
+        // If order is a reasonable timestamp (after 2000-01-01), use it
+        const year2000 = BigInt(Date.parse('2000-01-01'));
+        if (orderNum > year2000) {
+          return Number(orderNum);
+        }
+      } catch {}
+      
+      // Try to extract timestamp from the HTML itself
+      try {
+        const parser = document.createElement('template');
+        parser.innerHTML = rec.html.trim();
+        const node = parser.content.firstElementChild;
+        if (node) {
+          // Look for time element with datetime attribute
+          const timeEl = node.querySelector('time[datetime]');
+          if (timeEl) {
+            const datetime = timeEl.getAttribute('datetime');
+            if (datetime) {
+              const timestamp = Date.parse(datetime);
+              if (!isNaN(timestamp)) {
+                return timestamp;
+              }
+            }
+          }
+          
+          // Look for message ID in data attributes
+          const idAttr = node.getAttribute('data-list-item-id') || node.id || node.getAttribute('data-message-id');
+          if (idAttr) {
+            const m = String(idAttr).match(/(\d{17,})/); // Discord message IDs are 17-19 digits
+            if (m) {
+              const msgId = BigInt(m[1]);
+              // Discord message IDs contain timestamp in the high bits
+              // Extract approximate timestamp (snowflake ID format)
+              const timestamp = Number((msgId >> 22n) + 1420070400000n); // Discord epoch
+              if (timestamp > 0 && timestamp < Date.now() + 86400000) { // Sanity check
+                return timestamp;
+              }
+            }
+          }
+        }
+      } catch {}
+      
+      // Fallback to sequence number (not ideal, but better than nothing)
+      return rec.seq * 1000;
+    }
+    
+    // Sort by absolute timestamp (oldest first)
+    const sorted = records.slice().sort((a,b)=>{ 
+      const timeA = extractTimestamp(a);
+      const timeB = extractTimestamp(b);
+      return timeA - timeB; // Oldest first (ascending order)
+    });
+    
+    console.log(`[ChatGrabber] Merging ${sorted.length} messages into Discord structure (inverted: oldest first)`);
+    
+    // Remove all existing messages and placeholders from container
+    const existingChildren = Array.from(container.children);
+    existingChildren.forEach((child) => {
       const role = child.getAttribute && child.getAttribute('role');
       const cls = child.className || '';
-      if (role === 'progressbar' || child.getAttribute('aria-busy') === 'true' || /skeleton|placeholder|spinner|loading/i.test(cls)) {
+      const ariaBusy = child.getAttribute('aria-busy');
+      if (role === 'progressbar' || ariaBusy === 'true' || /skeleton|placeholder|spinner|loading/i.test(cls)) {
+        child.remove();
+      } else {
+        // Remove existing messages to replace with cached ones
         child.remove();
       }
     });
-    let inserted = 0;
+    
+    // Insert profile header at the beginning if we captured it
     const parser = document.createElement('template');
-    const existing = Array.from(container.querySelectorAll(':scope > *'));
-    function orderOfNode(n) {
+    let inserted = 0;
+    const seenKeys = new Set();
+    
+    if (profileHeaderHtml) {
       try {
-        const idAttr = n.getAttribute('data-list-item-id') || n.id || n.getAttribute('data-message-id');
-        const m = idAttr && String(idAttr).match(/(\d{6,})/); if (m) return BigInt(m[1]);
-        const t = n.querySelector && n.querySelector('time[datetime]');
-        if (t && t.getAttribute('datetime')) return BigInt(Date.parse(t.getAttribute('datetime'))||0);
-      } catch {}
-      return BigInt(0);
+        parser.innerHTML = profileHeaderHtml.trim();
+        const profileNode = parser.content.firstElementChild;
+        if (profileNode) {
+          container.insertBefore(profileNode.cloneNode(true), container.firstChild);
+          inserted++;
+          console.log('[ChatGrabber] Inserted profile header at beginning');
+        }
+      } catch (e) {
+        console.warn('[ChatGrabber] Error inserting profile header:', e);
+      }
     }
-    const existingOrders = existing.map(node => ({ node, order: orderOfNode(node) }));
-    const seenKeys = new Set(existing.map(n => n.getAttribute('data-list-item-id') || n.id).filter(Boolean));
-    const sorted = records.slice().sort((a,b)=>{ try { return (BigInt(a.order)-BigInt(b.order)); } catch { return 0; } });
+    
+    // Insert all cached messages in reverse chronological order (oldest first)
     for (const rec of sorted) {
+      // Skip duplicates
       if (rec.key && seenKeys.has(rec.key)) continue;
+      
       parser.innerHTML = rec.html.trim();
       const node = parser.content.firstElementChild;
       if (!node) continue;
-      const newOrder = (()=>{ try { return BigInt(rec.order); } catch { return orderOfNode(node); }})();
-      let placed = false;
-      for (let i=0;i<existingOrders.length;i++) {
-        if (newOrder < existingOrders[i].order) {
-          container.insertBefore(node.cloneNode(true), existingOrders[i].node);
-          existingOrders.splice(i,0,{ node, order: newOrder });
-          placed = true; break;
-        }
+      
+      // Skip if it's a placeholder
+      const role = node.getAttribute && node.getAttribute('role');
+      const cls = node.className || '';
+      if (role === 'progressbar' || node.getAttribute('aria-busy') === 'true' || /skeleton|placeholder|spinner|loading/i.test(cls)) {
+        continue;
       }
-      if (!placed) {
+      
+      // Append to container (oldest messages first, newest at bottom)
         container.appendChild(node.cloneNode(true));
-        existingOrders.push({ node, order: newOrder });
-      }
+      
       if (rec.key) seenKeys.add(rec.key);
       inserted++;
     }
-    return { ok: true, inserted, title: document.title };
+    
+    // Add a buffer/spacer at the bottom for extra scroll space
+    try {
+      const buffer = document.createElement('div');
+      buffer.style.height = '50px';
+      buffer.style.width = '100%';
+      buffer.style.flexShrink = '0';
+      buffer.setAttribute('data-sf-buffer', 'true');
+      container.appendChild(buffer);
+      console.log('[ChatGrabber] Added 50px buffer at bottom');
   } catch (e) {
+      console.warn('[ChatGrabber] Error adding buffer:', e);
+    }
+    
+    // Find the scroller and ensure it can scroll to show all messages
+    const scroller = container.closest('[class*="scroller"]') || 
+                     document.querySelector('[data-list-id="chat-messages"]')?.closest('[class*="scroller"]') ||
+                     document.querySelector('[role="log"]')?.closest('[class*="scroller"]') ||
+                     document.querySelector('main div[class*="scroller"]');
+    
+    if (scroller) {
+      try {
+        // Ensure container and scroller allow full scrolling
+        // Remove any max-height or overflow restrictions that might clip content
+        const scrollerStyle = window.getComputedStyle(scroller);
+        if (scrollerStyle.overflowY === 'hidden' || scrollerStyle.overflowY === 'clip') {
+          scroller.style.overflowY = 'auto';
+        }
+        
+        // Ensure the container has proper height
+        if (container) {
+          const containerStyle = window.getComputedStyle(container);
+          if (containerStyle.maxHeight && containerStyle.maxHeight !== 'none') {
+            container.style.maxHeight = 'none';
+          }
+        }
+        
+        // Force a layout recalculation to ensure all messages are rendered
+        void container.offsetHeight;
+        void scroller.offsetHeight;
+        
+        // Wait a moment for layout to settle
+        await new Promise(r => setTimeout(r, 100));
+        
+        // Calculate final scroll position to show newest messages
+        const finalScrollHeight = scroller.scrollHeight;
+        const finalClientHeight = scroller.clientHeight;
+        
+        // Scroll to bottom so newest messages are visible when .mhtml opens
+        // Scrolling up will show older messages (inverted behavior)
+        scroller.scrollTop = finalScrollHeight;
+        
+        // Double-check we can actually scroll to the bottom
+        // Sometimes scrollHeight needs a moment to update
+        await new Promise(r => setTimeout(r, 100));
+        if (scroller.scrollHeight > finalScrollHeight) {
+          scroller.scrollTop = scroller.scrollHeight;
+        }
+        
+        // Verify we can scroll all the way down
+        const maxScroll = scroller.scrollHeight - scroller.clientHeight;
+        if (scroller.scrollTop < maxScroll - 10) {
+          // If we're not at the bottom, try again
+          scroller.scrollTop = scroller.scrollHeight;
+        }
+        
+        console.log(`[ChatGrabber] Scroll setup complete: scrollHeight=${scroller.scrollHeight}, clientHeight=${scroller.clientHeight}, scrollTop=${scroller.scrollTop}`);
+      } catch (e) {
+        console.warn('[ChatGrabber] Error setting up scroll:', e);
+      }
+    }
+    
+    console.log(`[ChatGrabber] Successfully inserted ${inserted} messages into Discord structure`);
+    
+    return { ok: true, inserted, title: document.title, totalMessages: records.length };
+    } catch (e) {
+      console.error('[ChatGrabber] Error merging messages:', e);
     return { ok: false, error: String(e), title: document.title };
   }
+  })();
 }
 
 async function renderTranscriptInExtensionAndCapture(activeTab) {
@@ -436,6 +1672,18 @@ function getTranscriptHtmlForDownload() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
+      if (message?.type === 'SF_CHATGRABBER_PROGRESS') {
+        // Handle progress updates from chat grabber
+        const { progress, cachedMessages } = message;
+        console.log(`[ChatGrabber] Progress update: ${progress.cached} messages cached`, {
+          progress,
+          cachedMessagesCount: cachedMessages?.length || 0,
+          cachedMessages: cachedMessages
+        });
+        sendResponse({ ok: true });
+        return;
+      }
+      
       if (message?.type === 'SF_FETCH_AS_DATAURL') {
         const { url, asBinary, timeoutMs } = message;
         const controller = new AbortController();
