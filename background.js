@@ -81,6 +81,12 @@ async function captureMHTML(tab) {
     const conf = await chrome.storage.local.get([DISABLE_PHOTOS_KEY, DISABLE_GIFS_KEY]);
     const disablePhotos = !!conf[DISABLE_PHOTOS_KEY];
     const disableGifs = !!conf[DISABLE_GIFS_KEY];
+    
+    // Preload images before capture to ensure they're in the DOM
+    if (!disablePhotos && !disableGifs) {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: preloadImagesInPage });
+    }
+    
     if (disablePhotos || disableGifs) {
       await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: stripMediaInPage, args: [disablePhotos, disableGifs] });
     }
@@ -94,6 +100,310 @@ async function captureMHTML(tab) {
   } catch (e) {
     console.error('MHTML capture failed', e);
   }
+}
+
+function forceLoadAllImagesInMessages() {
+  return (async () => {
+    try {
+      // Find the message container
+      const container = document.querySelector('ol[data-list-id="chat-messages"]') || 
+                       document.querySelector('[role="log"]') ||
+                       document.querySelector('main');
+      
+      if (!container) {
+        console.warn('[ChatGrabber] Could not find message container for force-loading images');
+        return;
+      }
+      
+      // First, extract image URLs from anchor tags (Discord's originalLink pattern)
+      // and set them on the corresponding img elements
+      const originalLinks = Array.from(container.querySelectorAll('a[class*="originalLink"], a[href*="cdn.discordapp.com"], a[href*="attachments"]'));
+      originalLinks.forEach(link => {
+        try {
+          const imgUrl = link.href || link.getAttribute('data-safe-src');
+          if (imgUrl && (imgUrl.includes('cdn.discordapp.com') || imgUrl.includes('attachments'))) {
+            // Find the associated img element (usually a sibling or in the same container)
+            const imageContainer = link.closest('[class*="imageWrapper"], [class*="mosaicItem"], [class*="visualMediaItemContainer"], [class*="imageContainer"]');
+            if (imageContainer) {
+              const img = imageContainer.querySelector('img[class*="lazyImg"], img');
+              if (img) {
+                // Prefer original CDN URL over media.discordapp.net URLs
+                const currentSrc = img.src || img.getAttribute('src') || '';
+                if (!currentSrc || currentSrc.includes('media.discordapp.net') || currentSrc === 'about:blank') {
+                  img.src = imgUrl;
+                  img.removeAttribute('data-src');
+                  img.removeAttribute('data-lazy-src');
+                  img.removeAttribute('data-original');
+                  img.style.display = 'block';
+                  img.style.visibility = 'visible';
+                  img.style.opacity = '1';
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // Skip this link if there's an error
+        }
+      });
+      
+      // Find all images in messages
+      const allImages = Array.from(container.querySelectorAll('img'));
+      console.log(`[ChatGrabber] Force-loading ${allImages.length} images in messages`);
+      
+      let loaded = 0;
+      let promoted = 0;
+      const loadPromises = [];
+      const MAX_CONCURRENT = 15; // Higher limit for force-loading
+      
+      for (const img of allImages) {
+        try {
+          // Get image URL from any source
+          let src = img.getAttribute('data-src') || 
+                   img.getAttribute('data-lazy-src') || 
+                   img.getAttribute('data-original') ||
+                   img.getAttribute('data-lazy') ||
+                   img.getAttribute('data-url') ||
+                   img.getAttribute('src');
+          
+          // If we have a media.discordapp.net URL, try to find the original CDN URL
+          if (src && src.includes('media.discordapp.net')) {
+            const imageContainer = img.closest('[class*="imageWrapper"], [class*="mosaicItem"], [class*="visualMediaItemContainer"]');
+            if (imageContainer) {
+              const originalLink = imageContainer.querySelector('a[class*="originalLink"], a[href*="cdn.discordapp.com"]');
+              if (originalLink && originalLink.href) {
+                src = originalLink.href; // Prefer the original CDN URL
+              }
+            }
+          }
+          
+          if (!src || src.startsWith('data:') || src.startsWith('blob:') || src === 'about:blank') {
+            continue;
+          }
+          
+          // Make sure it's an absolute URL
+          try {
+            src = new URL(src, location.href).href;
+          } catch (e) {
+            if (!src.startsWith('http://') && !src.startsWith('https://') && !src.startsWith('//')) {
+              continue;
+            }
+          }
+          
+          // Promote lazy-loaded images
+          if (img.getAttribute('data-src') && !img.getAttribute('src')) {
+            img.src = src;
+            img.removeAttribute('data-src');
+            img.removeAttribute('data-lazy-src');
+            img.removeAttribute('data-original');
+            promoted++;
+          } else if (!img.getAttribute('src') || img.getAttribute('src') === 'about:blank' || (img.src && img.src.includes('media.discordapp.net') && src.includes('cdn.discordapp.com'))) {
+            img.src = src;
+            promoted++;
+          }
+          
+          // Ensure image is visible
+          img.style.display = 'block';
+          img.style.visibility = 'visible';
+          img.style.opacity = '1';
+          
+          // Force-load if not already loaded
+          if (!img.complete || img.naturalWidth === 0) {
+            // Wait if we've hit the concurrency limit
+            if (loadPromises.length >= MAX_CONCURRENT) {
+              await Promise.race(loadPromises);
+              // Remove resolved promises
+              for (let i = loadPromises.length - 1; i >= 0; i--) {
+                if (loadPromises[i] && loadPromises[i]._resolved) {
+                  loadPromises.splice(i, 1);
+                }
+              }
+            }
+            
+            const promise = new Promise((resolve) => {
+              const timeout = setTimeout(() => {
+                promise._resolved = true;
+                resolve();
+              }, 4000); // 4 second timeout
+              
+              const checkComplete = () => {
+                if (img.complete && img.naturalWidth > 0) {
+                  clearTimeout(timeout);
+                  promise._resolved = true;
+                  loaded++;
+                  resolve();
+                }
+              };
+              
+              // Check immediately
+              checkComplete();
+              
+              // Listen for load/error events
+              const loadHandler = () => {
+                clearTimeout(timeout);
+                promise._resolved = true;
+                loaded++;
+                resolve();
+              };
+              
+              const errorHandler = () => {
+                clearTimeout(timeout);
+                promise._resolved = true;
+                resolve(); // Don't fail on individual image errors
+              };
+              
+              img.addEventListener('load', loadHandler, { once: true });
+              img.addEventListener('error', errorHandler, { once: true });
+              
+              // Force load by setting src again (in case it wasn't set properly)
+              if (img.src !== src) {
+                img.src = src;
+              }
+            });
+            
+            loadPromises.push(promise);
+          } else {
+            loaded++; // Already loaded
+          }
+        } catch (e) {
+          // Skip this image if there's an error
+        }
+      }
+      
+      // Wait for all images to load
+      if (loadPromises.length > 0) {
+        await Promise.race([
+          Promise.all(loadPromises),
+          new Promise(resolve => setTimeout(resolve, 8000)) // Max 8 second wait
+        ]);
+      }
+      
+      console.log(`[ChatGrabber] Force-loaded ${loaded} images, promoted ${promoted} lazy-loaded images`);
+      
+      // Force a layout recalculation to ensure images are rendered
+      void container.offsetHeight;
+      
+      // Scroll a bit to trigger any viewport-based loading
+      const scroller = container.closest('[class*="scroller"]') || 
+                      document.querySelector('[data-list-id="chat-messages"]')?.closest('[class*="scroller"]');
+      if (scroller) {
+        const currentScroll = scroller.scrollTop;
+        scroller.scrollTop = currentScroll + 1;
+        await new Promise(r => setTimeout(r, 100));
+        scroller.scrollTop = currentScroll;
+      }
+    } catch (e) {
+      console.warn('[ChatGrabber] Error force-loading images:', e);
+    }
+  })();
+}
+
+function preloadImagesInPage() {
+  return (async () => {
+    try {
+      // Find all images that need to be loaded
+      const images = Array.from(document.querySelectorAll('img'));
+      const activePromises = [];
+      let processed = 0;
+      const MAX_CONCURRENT = 10; // Limit concurrent image loads to prevent memory issues
+      
+      // Process images with concurrency limit
+      for (const img of images) {
+        try {
+          // Get the actual source URL (check data-src for lazy loading)
+          const src = img.getAttribute('data-src') || 
+                      img.getAttribute('data-lazy-src') || 
+                      img.getAttribute('data-original') ||
+                      img.getAttribute('src');
+          
+          if (!src || src.startsWith('data:') || src.startsWith('blob:') || src === 'about:blank') {
+            continue; // Skip data URLs, blob URLs, and blank sources
+          }
+          
+          // If image has data-src but no src, promote it (lazy loading)
+          if (img.getAttribute('data-src') && !img.getAttribute('src')) {
+            try {
+              img.src = src;
+            } catch (e) {
+              // Ignore errors setting src
+            }
+          }
+          
+          // Only preload if image is not already loaded
+          if (!img.complete || img.naturalWidth === 0) {
+            // Wait if we've hit the concurrency limit
+            if (activePromises.length >= MAX_CONCURRENT) {
+              await Promise.race(activePromises);
+              // Remove resolved promises by filtering
+              for (let i = activePromises.length - 1; i >= 0; i--) {
+                if (activePromises[i] && activePromises[i]._resolved) {
+                  activePromises.splice(i, 1);
+                }
+              }
+            }
+            
+            const promise = new Promise((resolve) => {
+              const timeout = setTimeout(() => {
+                promise._resolved = true;
+                resolve();
+              }, 3000); // 3 second timeout per image
+              
+              const checkComplete = () => {
+                if (img.complete && img.naturalWidth > 0) {
+                  clearTimeout(timeout);
+                  promise._resolved = true;
+                  resolve();
+                }
+              };
+              
+              // Check immediately
+              checkComplete();
+              
+              // Also listen for load/error events
+              const loadHandler = () => {
+                clearTimeout(timeout);
+                promise._resolved = true;
+                resolve();
+              };
+              
+              const errorHandler = () => {
+                clearTimeout(timeout);
+                promise._resolved = true;
+                resolve(); // Don't fail on individual image errors
+              };
+              
+              img.addEventListener('load', loadHandler, { once: true });
+              img.addEventListener('error', errorHandler, { once: true });
+            });
+            
+            activePromises.push(promise);
+            processed++;
+          } else if (img.getAttribute('data-src') && !img.getAttribute('src')) {
+            // Image is loaded but src attribute is missing (lazy loading)
+            try {
+              img.src = src;
+            } catch (e) {
+              // Ignore errors
+            }
+          }
+        } catch (e) {
+          // Skip this image if there's an error
+          console.warn('[ChatGrabber] Error processing image:', e);
+        }
+      }
+      
+      // Wait for remaining images to load (with timeout)
+      if (activePromises.length > 0) {
+        await Promise.race([
+          Promise.all(activePromises),
+          new Promise(resolve => setTimeout(resolve, 5000)) // Max 5 second wait
+        ]);
+      }
+      
+      console.log(`[ChatGrabber] Processed ${processed} images for preloading`);
+    } catch (e) {
+      console.warn('[ChatGrabber] Error preloading images:', e);
+    }
+  })();
 }
 
 function stripMediaInPage(disablePhotos, disableGifs) {
@@ -186,7 +496,7 @@ async function captureChatHistory(tab) {
       const results = await chrome.scripting.executeScript({ 
         target: { tabId: tab.id, allFrames: false }, 
         func: autoScrollDiscordHistory, 
-        args: [300, 1200, 15, true] 
+        args: [10000, 1200, 15, true] 
       });
       scrollResult = results && results[0] ? results[0].result : null;
     } catch (e) {
@@ -233,16 +543,38 @@ async function captureChatHistory(tab) {
       throw new Error('Tab was closed or navigated away during capture');
     }
     
-    // 3) Apply media toggles if enabled
+    // 3) Force-load all images in merged messages to ensure they're visible in MHTML
     const conf = await chrome.storage.local.get([DISABLE_PHOTOS_KEY, DISABLE_GIFS_KEY]);
     const disablePhotos = !!conf[DISABLE_PHOTOS_KEY];
     const disableGifs = !!conf[DISABLE_GIFS_KEY];
     const didStrip = disablePhotos || disableGifs;
+    
+    if (!didStrip) {
+      // Force-load all images if we're not stripping them
+      try { 
+        await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: false }, func: forceLoadAllImagesInMessages }); 
+        // Give images time to load and render
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        console.warn('[ChatGrabber] Error force-loading images:', e);
+      }
+      
+      // Also run general preload as backup
+      try { 
+        await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: preloadImagesInPage }); 
+        // Give images more time to load
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) {
+        console.warn('[ChatGrabber] Error preloading images:', e);
+      }
+    }
+    
+    // 4) Apply media toggles if enabled
     if (didStrip) {
       try { await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: stripMediaInPage, args: [disablePhotos, disableGifs] }); } catch {}
     }
     
-    // 4) Capture the same tab as MHTML (keeps Discord layout)
+    // 5) Capture the same tab as MHTML (keeps Discord layout)
     const blob = await chrome.pageCapture.saveAsMHTML({ tabId: tab.id });
     const { siteName, username } = await getSiteAndUsername(tab.id);
     const filename = buildPreferredFilename(siteName, username) + '.mhtml';
@@ -251,7 +583,7 @@ async function captureChatHistory(tab) {
     const dataUrl = `data:multipart/related;base64,${base64}`;
     await chrome.downloads.download({ url: dataUrl, filename, saveAs: true });
     
-    // 5) Restore media if we stripped
+    // 6) Restore media if we stripped
     if (didStrip) {
       try { await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: restoreMediaInPage }); } catch {}
     }
@@ -496,7 +828,8 @@ function autoScrollDiscordHistory(maxMessages, settleMs, maxNoNew, untilTop) {
                                      originalImgs.find(orig => 
                                        orig.alt === cloneImg.getAttribute('alt') ||
                                        orig.getAttribute('data-src') === cloneImg.getAttribute('data-src') ||
-                                       orig.className === cloneImg.className
+                                       orig.className === cloneImg.className ||
+                                       orig.getAttribute('src') === cloneImg.getAttribute('src')
                                      );
                   
                   // Priority: data-src > src > currentSrc > original src
@@ -508,8 +841,11 @@ function autoScrollDiscordHistory(maxMessages, settleMs, maxNoNew, untilTop) {
                               originalImg.getAttribute('data-lazy-src') || 
                               originalImg.getAttribute('data-original') ||
                               originalImg.getAttribute('data-lazy') ||
-                              (originalImg.src && originalImg.src !== 'about:blank' ? originalImg.src : null) ||
-                              (originalImg.currentSrc || null);
+                              originalImg.getAttribute('data-url') ||
+                              // Check if image is loaded and has a valid src
+                              (originalImg.complete && originalImg.naturalWidth > 0 && originalImg.src && originalImg.src !== 'about:blank' && !originalImg.src.startsWith('data:') ? originalImg.src : null) ||
+                              (originalImg.currentSrc && originalImg.currentSrc !== 'about:blank' && !originalImg.currentSrc.startsWith('data:') ? originalImg.currentSrc : null) ||
+                              (originalImg.src && originalImg.src !== 'about:blank' && !originalImg.src.startsWith('data:') ? originalImg.src : null);
                   }
                   
                   // Fallback: check clone's own attributes
@@ -518,17 +854,45 @@ function autoScrollDiscordHistory(maxMessages, settleMs, maxNoNew, untilTop) {
                               cloneImg.getAttribute('data-lazy-src') || 
                               cloneImg.getAttribute('data-original') ||
                               cloneImg.getAttribute('data-lazy') ||
+                              cloneImg.getAttribute('data-url') ||
                               cloneImg.getAttribute('src');
                   }
                   
-                  // Set the URL if we found one
-                  if (imageUrl && imageUrl !== 'about:blank') {
-                    cloneImg.setAttribute('src', imageUrl);
+                  // Additional fallback: check background-image style
+                  if (!imageUrl && originalImg) {
+                    try {
+                      const bgImage = window.getComputedStyle(originalImg).backgroundImage;
+                      if (bgImage && bgImage !== 'none') {
+                        const urlMatch = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                        if (urlMatch && urlMatch[1]) {
+                          imageUrl = urlMatch[1];
+                        }
+                      }
+                    } catch (e) {
+                      // Ignore errors getting computed style
+                    }
+                  }
+                  
+                  // Set the URL if we found one and it's valid
+                  if (imageUrl && imageUrl !== 'about:blank' && !imageUrl.startsWith('data:') && imageUrl.trim()) {
+                    // Make sure it's an absolute URL
+                    try {
+                      const absUrl = new URL(imageUrl, location.href).href;
+                      cloneImg.setAttribute('src', absUrl);
+                    } catch (e) {
+                      // If URL parsing fails, try to use as-is if it looks like a URL
+                      if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://') || imageUrl.startsWith('//')) {
+                        cloneImg.setAttribute('src', imageUrl);
+                      }
+                    }
                   }
                   
                   // Also copy srcset if available
-                  if (originalImg && originalImg.srcset) {
-                    cloneImg.setAttribute('srcset', originalImg.srcset);
+                  if (originalImg) {
+                    const srcset = originalImg.getAttribute('data-srcset') || originalImg.srcset || originalImg.getAttribute('srcset');
+                    if (srcset) {
+                      cloneImg.setAttribute('srcset', srcset);
+                    }
                   }
                 });
                 
@@ -573,32 +937,171 @@ function autoScrollDiscordHistory(maxMessages, settleMs, maxNoNew, untilTop) {
                 });
                 
                 // Handle Discord's attachment containers - grab URLs from nested media
-                clone.querySelectorAll('[class*="attachment"], [class*="imageWrapper"], [class*="media"], [class*="embed"]').forEach(container => {
-                  const containerClasses = container.className.split(' ').filter(c => c);
-                  const originalContainer = containerClasses.length > 0 
-                    ? el.querySelector(`.${containerClasses[0]}`) 
-                    : null;
-                  
-                  if (originalContainer) {
-                    // Copy image URLs from original container
-                    originalContainer.querySelectorAll('img').forEach(origImg => {
-                      const cloneImg = container.querySelector('img');
-                      if (cloneImg) {
-                        const imgUrl = origImg.getAttribute('data-src') || 
-                                     (origImg.src && origImg.src !== 'about:blank' ? origImg.src : null) ||
-                                     origImg.currentSrc;
-                        if (imgUrl && !cloneImg.getAttribute('src')) {
-                          cloneImg.setAttribute('src', imgUrl);
+                // This includes attachment containers, image wrappers, media containers, and embed containers
+                const attachmentSelectors = [
+                  '[class*="attachment"]',
+                  '[class*="imageWrapper"]',
+                  '[class*="media"]',
+                  '[class*="embed"]',
+                  '[class*="attachmentContainer"]',
+                  '[class*="imageContainer"]',
+                  '[class*="mediaContainer"]',
+                  '[class*="visualMediaItemContainer"]',
+                  '[class*="mosaicItem"]',
+                  '[class*="imageContent"]',
+                  '[class*="lazyImgContainer"]',
+                  '[role="img"]',
+                  '[data-testid*="image"]',
+                  '[data-testid*="attachment"]'
+                ];
+                
+                attachmentSelectors.forEach(selector => {
+                  clone.querySelectorAll(selector).forEach(container => {
+                    try {
+                      // Try multiple strategies to find the original container
+                      let originalContainer = null;
+                      
+                      // Strategy 1: Match by class name
+                      const containerClasses = (container.className || '').split(' ').filter(c => c && c.length > 0);
+                      if (containerClasses.length > 0) {
+                        for (const cls of containerClasses) {
+                          const found = el.querySelector(`.${cls}`);
+                          if (found) {
+                            originalContainer = found;
+                            break;
+                          }
                         }
                       }
-                    });
-                    
-                    // Copy background images
-                    const bgImage = window.getComputedStyle(originalContainer).backgroundImage;
-                    if (bgImage && bgImage !== 'none') {
-                      container.style.backgroundImage = bgImage;
+                      
+                      // Strategy 2: Match by data attributes
+                      if (!originalContainer) {
+                        const dataAttrs = Array.from(container.attributes)
+                          .filter(attr => attr.name.startsWith('data-'))
+                          .map(attr => `[${attr.name}="${attr.value}"]`);
+                        if (dataAttrs.length > 0) {
+                          originalContainer = el.querySelector(dataAttrs[0]);
+                        }
+                      }
+                      
+                      // Strategy 3: Match by position/index
+                      if (!originalContainer) {
+                        const allContainers = Array.from(el.querySelectorAll(selector));
+                        const cloneIndex = Array.from(clone.querySelectorAll(selector)).indexOf(container);
+                        if (cloneIndex >= 0 && cloneIndex < allContainers.length) {
+                          originalContainer = allContainers[cloneIndex];
+                        }
+                      }
+                      
+                      if (originalContainer) {
+                        // Copy all images from original container
+                        originalContainer.querySelectorAll('img').forEach((origImg, imgIdx) => {
+                          const cloneImgs = container.querySelectorAll('img');
+                          const cloneImg = cloneImgs[imgIdx] || cloneImgs[0];
+                          
+                          if (cloneImg) {
+                            // Get image URL from multiple sources
+                            let imgUrl = origImg.getAttribute('data-src') || 
+                                       origImg.getAttribute('data-lazy-src') ||
+                                       origImg.getAttribute('data-original') ||
+                                       origImg.getAttribute('data-url') ||
+                                       (origImg.complete && origImg.naturalWidth > 0 && origImg.src && origImg.src !== 'about:blank' && !origImg.src.startsWith('data:') ? origImg.src : null) ||
+                                       (origImg.currentSrc && origImg.currentSrc !== 'about:blank' && !origImg.currentSrc.startsWith('data:') ? origImg.currentSrc : null) ||
+                                       (origImg.src && origImg.src !== 'about:blank' && !origImg.src.startsWith('data:') ? origImg.src : null);
+                            
+                            // Special handling for Discord's visual media items
+                            // Check for originalLink anchor tag (contains the original CDN URL)
+                            if (!imgUrl || imgUrl.includes('media.discordapp.net')) {
+                              const originalLink = originalContainer.querySelector('a[class*="originalLink"], a[href*="cdn.discordapp.com"], a[href*="attachments"]');
+                              if (originalLink && originalLink.href) {
+                                // Prefer the original CDN URL over the media.discordapp.net URL
+                                imgUrl = originalLink.href;
+                              }
+                            }
+                            
+                            // Also check for data-safe-src attribute on anchor tags
+                            if (!imgUrl) {
+                              const anchorWithSafeSrc = originalContainer.querySelector('a[data-safe-src]');
+                              if (anchorWithSafeSrc) {
+                                imgUrl = anchorWithSafeSrc.getAttribute('data-safe-src');
+                              }
+                            }
+                            
+                            if (imgUrl) {
+                              try {
+                                const absUrl = new URL(imgUrl, location.href).href;
+                                cloneImg.setAttribute('src', absUrl);
+                                // Remove lazy-loading attributes
+                                cloneImg.removeAttribute('data-src');
+                                cloneImg.removeAttribute('data-lazy-src');
+                                cloneImg.removeAttribute('data-original');
+                                // Ensure image is visible
+                                cloneImg.style.display = 'block';
+                                cloneImg.style.visibility = 'visible';
+                                cloneImg.style.opacity = '1';
+                              } catch (e) {
+                                if (imgUrl.startsWith('http://') || imgUrl.startsWith('https://') || imgUrl.startsWith('//')) {
+                                  cloneImg.setAttribute('src', imgUrl);
+                                  cloneImg.style.display = 'block';
+                                  cloneImg.style.visibility = 'visible';
+                                  cloneImg.style.opacity = '1';
+                                }
+                              }
+                            }
+                            
+                            // Copy srcset
+                            const srcset = origImg.getAttribute('data-srcset') || origImg.srcset || origImg.getAttribute('srcset');
+                            if (srcset) {
+                              cloneImg.setAttribute('srcset', srcset);
+                            }
+                          }
+                        });
+                        
+                        // Also copy anchor links that contain image URLs (for Discord's originalLink pattern)
+                        originalContainer.querySelectorAll('a[class*="originalLink"], a[href*="cdn.discordapp.com"], a[href*="attachments"]').forEach((origLink) => {
+                          const cloneLinks = container.querySelectorAll('a[class*="originalLink"], a[href*="cdn.discordapp.com"], a[href*="attachments"]');
+                          const cloneLink = Array.from(cloneLinks).find(link => 
+                            link.getAttribute('href') === origLink.getAttribute('href') ||
+                            link.className === origLink.className
+                          ) || cloneLinks[0];
+                          
+                          if (cloneLink && origLink.href) {
+                            cloneLink.setAttribute('href', origLink.href);
+                            // Also copy data-safe-src if present
+                            if (origLink.getAttribute('data-safe-src')) {
+                              cloneLink.setAttribute('data-safe-src', origLink.getAttribute('data-safe-src'));
+                            }
+                          }
+                        });
+                        
+                        // Copy background images from computed styles
+                        try {
+                          const bgImage = window.getComputedStyle(originalContainer).backgroundImage;
+                          if (bgImage && bgImage !== 'none') {
+                            const urlMatch = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                            if (urlMatch && urlMatch[1]) {
+                              container.style.backgroundImage = bgImage;
+                            }
+                          }
+                        } catch (e) {
+                          // Ignore errors getting computed style
+                        }
+                        
+                        // Copy any link elements that might contain image URLs
+                        originalContainer.querySelectorAll('a[href*=".jpg"], a[href*=".jpeg"], a[href*=".png"], a[href*=".gif"], a[href*=".webp"]').forEach(origLink => {
+                          const cloneLinks = container.querySelectorAll('a');
+                          const cloneLink = Array.from(cloneLinks).find(link => 
+                            link.getAttribute('href') === origLink.getAttribute('href') ||
+                            link.textContent === origLink.textContent
+                          );
+                          if (cloneLink && origLink.href) {
+                            cloneLink.setAttribute('href', origLink.href);
+                          }
+                        });
+                      }
+                    } catch (e) {
+                      // Skip this container if there's an error
                     }
-                  }
+                  });
                 });
               } catch (mediaErr) {
                 console.warn('[ChatGrabber] Error processing media:', mediaErr);
@@ -1611,7 +2114,179 @@ function mergeBufferedMessagesIntoDiscordPage() {
       }
     }
     
-    console.log(`[ChatGrabber] Successfully inserted ${inserted} messages into Discord structure`);
+        console.log(`[ChatGrabber] Successfully inserted ${inserted} messages into Discord structure`);
+    
+    // Wait a moment for DOM to settle before processing images
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    // Force-load all images in merged messages to ensure they're visible
+    try {
+      const allImages = Array.from(container.querySelectorAll('img'));
+      let forceLoaded = 0;
+      
+      for (const img of allImages) {
+        try {
+          // Get image URL from any source
+          let src = img.getAttribute('data-src') || 
+                   img.getAttribute('data-lazy-src') || 
+                   img.getAttribute('data-original') ||
+                   img.getAttribute('data-lazy') ||
+                   img.getAttribute('data-url') ||
+                   img.getAttribute('src');
+          
+          if (!src || src.startsWith('data:') || src.startsWith('blob:') || src === 'about:blank') {
+            continue;
+          }
+          
+          // Make sure it's an absolute URL
+          try {
+            src = new URL(src, location.href).href;
+          } catch (e) {
+            if (!src.startsWith('http://') && !src.startsWith('https://') && !src.startsWith('//')) {
+              continue;
+            }
+          }
+          
+          // Promote lazy-loaded images
+          if (img.getAttribute('data-src') && !img.getAttribute('src')) {
+            img.src = src;
+            img.removeAttribute('data-src');
+            img.removeAttribute('data-lazy-src');
+            img.removeAttribute('data-original');
+            forceLoaded++;
+          } else if (!img.getAttribute('src') || img.getAttribute('src') === 'about:blank') {
+            img.src = src;
+            forceLoaded++;
+          }
+          
+          // Ensure image is visible (remove any hiding styles)
+          if (img.style.display === 'none') {
+            img.style.display = '';
+          }
+          if (img.style.visibility === 'hidden') {
+            img.style.visibility = 'visible';
+          }
+          if (img.style.opacity === '0') {
+            img.style.opacity = '1';
+          }
+        } catch (e) {
+          // Skip this image if there's an error
+        }
+      }
+      
+      console.log(`[ChatGrabber] Promoted ${forceLoaded} lazy-loaded images in merged messages`);
+    } catch (e) {
+      console.warn('[ChatGrabber] Error promoting images after merge:', e);
+    }
+    
+    // Ensure all images in merged messages are loaded (but don't block on it)
+    // Process images in smaller batches to avoid memory issues and crashes
+    try {
+      const allImages = Array.from(container.querySelectorAll('img'));
+      
+      // Skip image preloading if there are too many images to prevent crashes
+      if (allImages.length > 500) {
+        console.log(`[ChatGrabber] Too many images (${allImages.length}), skipping preload to prevent crashes. Images will load naturally.`);
+      } else {
+        let processed = 0;
+        const MAX_CONCURRENT = 3; // Very small batch size to prevent crashes
+        const BATCH_SIZE = 10; // Process only 10 images at a time
+        
+        // Process images in batches
+        for (let i = 0; i < allImages.length; i += BATCH_SIZE) {
+          const batch = allImages.slice(i, i + BATCH_SIZE);
+          const batchPromises = [];
+          
+          for (const img of batch) {
+            try {
+              const src = img.getAttribute('src') || 
+                         img.getAttribute('data-src') || 
+                         img.getAttribute('data-lazy-src');
+              
+              if (!src || src.startsWith('data:') || src.startsWith('blob:') || src === 'about:blank') {
+                continue;
+              }
+              
+              // If image has data-src but no src, promote it
+              if (img.getAttribute('data-src') && !img.getAttribute('src')) {
+                try {
+                  img.src = src;
+                } catch (e) {
+                  // Ignore errors setting src
+                }
+              }
+              
+              // Only preload if not already loaded
+              if (!img.complete || img.naturalWidth === 0) {
+                // Limit concurrent loads per batch
+                if (batchPromises.length >= MAX_CONCURRENT) {
+                  await Promise.race(batchPromises);
+                  // Remove resolved promises
+                  for (let j = batchPromises.length - 1; j >= 0; j--) {
+                    if (batchPromises[j] && batchPromises[j]._resolved) {
+                      batchPromises.splice(j, 1);
+                    }
+                  }
+                }
+                
+                const promise = new Promise((resolve) => {
+                  const timeout = setTimeout(() => {
+                    promise._resolved = true;
+                    resolve();
+                  }, 1500); // 1.5 second timeout per image
+                  
+                  const checkComplete = () => {
+                    if (img.complete && img.naturalWidth > 0) {
+                      clearTimeout(timeout);
+                      promise._resolved = true;
+                      resolve();
+                    }
+                  };
+                  
+                  checkComplete();
+                  
+                  img.addEventListener('load', () => {
+                    clearTimeout(timeout);
+                    promise._resolved = true;
+                    resolve();
+                  }, { once: true });
+                  
+                  img.addEventListener('error', () => {
+                    clearTimeout(timeout);
+                    promise._resolved = true;
+                    resolve(); // Don't fail on individual image errors
+                  }, { once: true });
+                });
+                
+                batchPromises.push(promise);
+                processed++;
+              }
+            } catch (e) {
+              // Skip this image if there's an error
+              // Don't log to avoid spam
+            }
+          }
+          
+          // Wait for this batch to complete (with timeout)
+          if (batchPromises.length > 0) {
+            await Promise.race([
+              Promise.all(batchPromises),
+              new Promise(resolve => setTimeout(resolve, 2000)) // Max 2 second wait per batch
+            ]);
+          }
+          
+          // Small delay between batches to prevent overwhelming the browser
+          if (i + BATCH_SIZE < allImages.length) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+        }
+        
+        console.log(`[ChatGrabber] Processed ${processed} images for preloading`);
+      }
+    } catch (e) {
+      console.warn('[ChatGrabber] Error preloading images after merge:', e);
+      // Don't throw - continue even if image preloading fails
+    }
     
     return { ok: true, inserted, title: document.title, totalMessages: records.length };
     } catch (e) {
@@ -1686,21 +2361,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       if (message?.type === 'SF_FETCH_AS_DATAURL') {
         const { url, asBinary, timeoutMs } = message;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs || 20000);
-        const res = await fetch(url, { credentials: 'include', signal: controller.signal });
-        clearTimeout(timeout);
-        if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
-        const contentType = res.headers.get('content-type') || '';
-        if (asBinary) {
-          const blob = await res.blob();
-          const arrayBuffer = await blob.arrayBuffer();
-          const base64 = arrayBufferToBase64(arrayBuffer);
-          sendResponse({ ok: true, dataUrl: `data:${contentType};base64,${base64}` });
-        } else {
-          const text = await res.text();
-          const encoded = encodeURIComponent(text).replace(/%20/g, '+');
-          sendResponse({ ok: true, dataUrl: `data:${contentType};charset=utf-8,${encoded}` });
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), timeoutMs || 30000);
+          let res;
+          try {
+            res = await fetch(url, { 
+              credentials: 'include', 
+              signal: controller.signal,
+              mode: 'cors',
+              cache: 'no-cache'
+            });
+          } catch (fetchErr) {
+            // If CORS fails, try no-cors mode (limited but might work for some images)
+            if (fetchErr.name === 'TypeError' && fetchErr.message.includes('CORS')) {
+              try {
+                res = await fetch(url, { 
+                  credentials: 'include', 
+                  signal: controller.signal,
+                  mode: 'no-cors',
+                  cache: 'no-cache'
+                });
+                // no-cors mode returns opaque response, we can't read it
+                // But we can still try to use the URL as-is
+                console.warn('[ChatGrabber] CORS blocked fetch for:', url, '- using original URL');
+                sendResponse({ ok: false, error: 'CORS blocked', url });
+                return;
+              } catch (noCorsErr) {
+                clearTimeout(timeout);
+                throw new Error(`Fetch failed: ${fetchErr.message}`);
+              }
+            }
+            clearTimeout(timeout);
+            throw fetchErr;
+          }
+          clearTimeout(timeout);
+          if (!res.ok) {
+            // For 404 or other errors, log but don't fail completely
+            console.warn('[ChatGrabber] Fetch failed for:', url, 'Status:', res.status);
+            sendResponse({ ok: false, error: `Fetch failed ${res.status}`, url });
+            return;
+          }
+          const contentType = res.headers.get('content-type') || '';
+          if (asBinary) {
+            const blob = await res.blob();
+            const arrayBuffer = await blob.arrayBuffer();
+            const base64 = arrayBufferToBase64(arrayBuffer);
+            // Ensure we have a proper content type
+            const finalContentType = contentType || blob.type || 'application/octet-stream';
+            sendResponse({ ok: true, dataUrl: `data:${finalContentType};base64,${base64}` });
+          } else {
+            const text = await res.text();
+            const encoded = encodeURIComponent(text).replace(/%20/g, '+');
+            sendResponse({ ok: true, dataUrl: `data:${contentType};charset=utf-8,${encoded}` });
+          }
+        } catch (err) {
+          console.error('[ChatGrabber] Error fetching as data URL:', url, err);
+          sendResponse({ ok: false, error: String(err), url });
         }
         return;
       }

@@ -102,10 +102,45 @@
             node.setAttribute('srcset', newSet);
           } else {
             const absUrl = new URL(val, location.href).href;
-            const dataUrl = await fetchAsDataUrl(absUrl, true);
-            node.setAttribute(attr, dataUrl);
+            // Skip data URLs and blob URLs
+            if (absUrl.startsWith('data:') || absUrl.startsWith('blob:')) {
+              continue;
+            }
+            try {
+              const dataUrl = await fetchAsDataUrl(absUrl, true);
+              node.setAttribute(attr, dataUrl);
+            } catch (fetchErr) {
+              // If fetch fails, try to get the image from the original element if it's loaded
+              if (selector === 'img' && attr === 'src') {
+                try {
+                  const originalImg = document.querySelector(`img[src="${val}"], img[data-src="${val}"]`);
+                  if (originalImg && originalImg.complete && originalImg.naturalWidth > 0) {
+                    // Image is loaded, try to get it via canvas
+                    const canvas = document.createElement('canvas');
+                    canvas.width = originalImg.naturalWidth;
+                    canvas.height = originalImg.naturalHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(originalImg, 0, 0);
+                    try {
+                      const dataUrl = canvas.toDataURL('image/png');
+                      node.setAttribute(attr, dataUrl);
+                      await log('info', 'Inlined image via canvas fallback:', absUrl);
+                      continue;
+                    } catch (canvasErr) {
+                      await log('warn', 'Canvas fallback failed for:', absUrl, canvasErr);
+                    }
+                  }
+                } catch (fallbackErr) {
+                  await log('warn', 'Fallback failed for:', absUrl, fallbackErr);
+                }
+              }
+              // Log the error but don't fail completely
+              await log('warn', 'Failed to inline media:', absUrl, fetchErr);
+            }
           }
-        } catch {}
+        } catch (err) {
+          await log('error', 'Error inlining media:', err);
+        }
       }
     }
   }
